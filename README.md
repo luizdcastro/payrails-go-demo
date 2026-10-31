@@ -28,8 +28,8 @@ PORT=5000
 Clone the repository:
 
 ```bash
-git clone https://github.com/luizdcastro/payrails_go_demo.git
-cd payrails_go_demo
+git clone https://github.com/luizdcastro/payrails-go-demo.git
+cd payrails-go-demo
 ```
 
 Install dependencies:
