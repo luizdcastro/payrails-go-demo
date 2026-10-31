@@ -2,11 +2,12 @@ package controllers
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 	"sync"
@@ -42,6 +43,22 @@ var (
 	tokenMutex  sync.Mutex
 )
 
+// One HTTP client for the process, so connections to Payrails (and their mTLS handshakes) are reused.
+var (
+	clientOnce   sync.Once
+	sharedClient *http.Client
+	clientErr    error
+)
+
+const requestTimeout = 15 * time.Second
+
+func payrailsClient(cfg *Config) (*http.Client, error) {
+	clientOnce.Do(func() {
+		sharedClient, clientErr = createMTLSClientFromBase64(cfg.CertB64, cfg.KeyB64)
+	})
+	return sharedClient, clientErr
+}
+
 func getBearerToken(cfg *Config, client *http.Client) (string, error) {
 	if cfg.ClientID == "" || cfg.APIKey == "" || cfg.BaseURL == "" {
 		return "", fmt.Errorf("clientId, apiKey, or baseUrl missing")
@@ -69,7 +86,10 @@ func getBearerToken(cfg *Config, client *http.Client) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read token response: %v", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("failed to fetch token: %s", string(body))
 	}
@@ -91,7 +111,7 @@ func getBearerToken(cfg *Config, client *http.Client) (string, error) {
 
 func createMTLSClientFromBase64(certB64, keyB64 string) (*http.Client, error) {
 	if certB64 == "" || keyB64 == "" {
-		return http.DefaultClient, nil
+		return &http.Client{Timeout: requestTimeout}, nil
 	}
 
 	certPEM, err := base64.StdEncoding.DecodeString(certB64)
@@ -115,6 +135,7 @@ func createMTLSClientFromBase64(certB64, keyB64 string) (*http.Client, error) {
 	}
 
 	return &http.Client{
+		Timeout: requestTimeout,
 		Transport: &http.Transport{
 			TLSClientConfig: tlsConfig,
 		},
@@ -125,12 +146,12 @@ func InitSDK(c *gin.Context) {
 	cfg := LoadConfig()
 
 	clientKey := c.GetHeader("x-client-key")
-	if clientKey != cfg.StaticClientKey || cfg.StaticClientKey == "" {
+	if cfg.StaticClientKey == "" || subtle.ConstantTimeCompare([]byte(clientKey), []byte(cfg.StaticClientKey)) != 1 {
 		c.JSON(401, gin.H{"error": "missing or invalid client key"})
 		return
 	}
 
-	client, err := createMTLSClientFromBase64(cfg.CertB64, cfg.KeyB64)
+	client, err := payrailsClient(cfg)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -159,8 +180,16 @@ func InitSDK(c *gin.Context) {
 		}
 	}
 
-	jsonPayload, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonPayload))
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-idempotency-key", idempotencyKey)
@@ -168,14 +197,27 @@ func InitSDK(c *gin.Context) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
+		c.JSON(502, gin.H{"error": err.Error()})
 		return
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := ioutil.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.JSON(502, gin.H{"error": err.Error()})
+		return
+	}
 	var respData map[string]interface{}
 	_ = json.Unmarshal(respBody, &respData)
+
+	// Payrails' own errors are passed on as errors, with its status and body.
+	if resp.StatusCode >= 400 {
+		c.JSON(resp.StatusCode, gin.H{
+			"status": "error",
+			"data":   respData,
+		})
+		return
+	}
 
 	c.JSON(resp.StatusCode, gin.H{
 		"status": "success",
